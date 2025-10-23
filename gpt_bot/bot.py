@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
@@ -40,6 +41,52 @@ def load_settings() -> Settings:
     return Settings(token, output_dir, duration, model)
 
 
+def _stringify_message_content(value: Any) -> str:
+    """Coerce a g4f message content object into a printable string."""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in ("text", "content"):
+            if key in value:
+                text = _stringify_message_content(value[key])
+                if text:
+                    parts.append(text)
+        return "\n".join(parts).strip()
+    if isinstance(value, (list, tuple, set)):
+        parts = [part for item in value if (part := _stringify_message_content(item))]
+        return "\n".join(parts).strip()
+    return str(value).strip()
+
+
+def _extract_choice_content(choice: Any) -> str:
+    """Extract textual content from a g4f completion choice."""
+
+    message = getattr(choice, "message", None)
+    if message is None and isinstance(choice, dict):
+        message = choice.get("message")
+    if message is None:
+        # Some providers only populate `delta` for streaming-like payloads.
+        message = getattr(choice, "delta", None)
+
+    raw_content: Any = None
+    if message is not None:
+        raw_content = getattr(message, "content", None)
+        if raw_content is None and isinstance(message, dict):
+            raw_content = message.get("content")
+
+    if raw_content is None:
+        # Fallback to the choice itself in case providers embed the content there.
+        raw_content = getattr(choice, "content", None)
+        if raw_content is None and isinstance(choice, dict):
+            raw_content = choice.get("content")
+
+    return _stringify_message_content(raw_content)
+
+
 async def generate_storyboard(prompt: str, model: str) -> str:
     client = Client()
     response = await asyncio.to_thread(
@@ -59,9 +106,12 @@ async def generate_storyboard(prompt: str, model: str) -> str:
     choices = getattr(response, "choices", [])
     if not choices:
         raise RuntimeError("g4f не вернул ни одного варианта ответа")
-    content = choices[0].message.content
+
+    content = _extract_choice_content(choices[0])
     if not content:
-        raise RuntimeError("g4f вернул пустой ответ")
+        raise RuntimeError(
+            "g4f не смог предоставить текст ответа. Попробуйте повторить запрос или выбрать другую модель."
+        )
     return content
 
 
