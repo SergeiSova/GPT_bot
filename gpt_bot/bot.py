@@ -13,7 +13,7 @@ from typing import Any
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message
+from aiogram.types import BotCommand, FSInputFile, Message
 from dotenv import load_dotenv
 from g4f.client import Client
 
@@ -158,20 +158,25 @@ async def handle_video_command(message: Message, settings: Settings) -> None:
         logger.warning("Could not remove temporary file %s", final_path)
 
 
+async def _register_commands(bot: Bot) -> None:
+    await bot.set_my_commands([BotCommand(command="video", description="Сгенерировать бесплатное минутное видео")])
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = load_settings()
 
-    bot = Bot(token=settings.telegram_token)
+    bot = Bot(token=settings.telegram_token, parse_mode=ParseMode.HTML)
     dp = Dispatcher()
-
     dp.message.register(partial(handle_video_command, settings=settings), Command("video"))
 
+    await bot.delete_webhook(drop_pending_updates=True)
+    await _register_commands(bot)
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
