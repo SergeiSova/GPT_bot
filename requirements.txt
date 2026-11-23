@@ -1,5 +1,5 @@
 aiogram==3.4.1
-g4f==0.2.8.2
+httpx>=0.27,<1
 moviepy==1.0.3
 numpy==1.26.4
 python-dotenv==1.0.1
