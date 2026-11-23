@@ -1,111 +1,65 @@
-"""Клиент официального GigaChat API."""
+"""Клиент официального API Z.ai для бесплатной модели GLM-4.7-Flash."""
 from __future__ import annotations
 
 import asyncio
-import ssl
-import time
-import uuid
 
 import httpx
 
-OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-CHAT_URL = "https://api.giga.chat/v1/chat/completions"
-TOKEN_LIFETIME_SECONDS = 30 * 60
-TOKEN_REFRESH_MARGIN_SECONDS = 60
-REQUEST_TIMEOUT_SECONDS = 60.0
+CHAT_URL = "https://api.z.ai/api/paas/v4/chat/completions"
+DEFAULT_MODEL = "glm-4.7-flash"
+REQUEST_TIMEOUT_SECONDS = 90.0
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+RETRY_DELAYS_SECONDS = (2, 5)
+FAILED_FINISH_REASONS = {"sensitive", "model_context_window_exceeded", "network_error"}
 
 
 class LLMError(RuntimeError):
-    """GigaChat не смог вернуть текст ответа."""
+    """Модель не смогла вернуть текст ответа."""
 
 
-def _build_tls_context(ca_bundle_file: str | None) -> ssl.SSLContext:
-    context = ssl.create_default_context()
-    if ca_bundle_file:
-        try:
-            context.load_verify_locations(cafile=ca_bundle_file)
-        except (OSError, ssl.SSLError) as exc:
-            raise LLMError(f"Не удалось загрузить сертификат: {ca_bundle_file}") from exc
-    return context
-
-
-def _token_deadline(expires_at: object) -> float:
-    """API может вернуть время в секундах или миллисекундах."""
-    latest = time.time() + TOKEN_LIFETIME_SECONDS
+def _error_code(response: httpx.Response) -> object:
     try:
-        value = float(expires_at)
-    except (TypeError, ValueError):
-        return latest - TOKEN_REFRESH_MARGIN_SECONDS
-    if value > 1e12:
-        value /= 1000
-    return min(value, latest) - TOKEN_REFRESH_MARGIN_SECONDS
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    return error.get("code") if isinstance(error, dict) else payload.get("code")
 
 
-class GigaChatClient:
+class ZaiClient:
     def __init__(
         self,
-        auth_key: str,
-        scope: str = "GIGACHAT_API_PERS",
-        model: str = "GigaChat",
-        ca_bundle_file: str | None = None,
+        api_key: str,
+        model: str = DEFAULT_MODEL,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self._auth_key = auth_key.strip().removeprefix("Basic ").strip()
-        self._scope = scope
         self._model = model
         self._http = httpx.AsyncClient(
-            verify=_build_tls_context(ca_bundle_file),
+            headers={"Authorization": f"Bearer {api_key.strip()}", "Accept-Language": "en-US,en"},
             timeout=REQUEST_TIMEOUT_SECONDS,
             transport=transport,
         )
-        self._token_lock = asyncio.Lock()
-        self._access_token: str | None = None
-        self._expires_at = 0.0
 
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def _get_token(self, stale_token: str | None = None) -> str:
-        async with self._token_lock:
-            token_is_fresh = self._access_token and time.time() < self._expires_at
-            if token_is_fresh and self._access_token != stale_token:
-                return self._access_token
-
+    async def _post(self, payload: dict) -> httpx.Response:
+        for delay in (*RETRY_DELAYS_SECONDS, None):
             try:
-                response = await self._http.post(
-                    OAUTH_URL,
-                    headers={
-                        "Authorization": f"Basic {self._auth_key}",
-                        "RqUID": str(uuid.uuid4()),
-                        "Accept": "application/json",
-                    },
-                    data={"scope": self._scope},
-                )
+                response = await self._http.post(CHAT_URL, json=payload)
             except httpx.HTTPError as exc:
-                raise LLMError(f"Нет соединения с GigaChat: {type(exc).__name__}") from None
-
-            if response.status_code != 200:
-                raise LLMError(f"GigaChat отказал в авторизации: HTTP {response.status_code}")
-            try:
-                payload = response.json()
-                self._access_token = payload["access_token"]
-            except (KeyError, TypeError, ValueError):
-                raise LLMError("GigaChat вернул некорректный токен") from None
-            self._expires_at = _token_deadline(payload.get("expires_at"))
-            return self._access_token
-
-    async def _post_chat(self, payload: dict, token: str) -> httpx.Response:
-        try:
-            return await self._http.post(
-                CHAT_URL,
-                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                json=payload,
-            )
-        except httpx.HTTPError as exc:
-            raise LLMError(f"Нет соединения с GigaChat: {type(exc).__name__}") from None
+                if delay is None:
+                    raise LLMError(f"Нет соединения с Z.ai: {type(exc).__name__}") from None
+            else:
+                if response.status_code not in RETRY_STATUSES or delay is None:
+                    return response
+            await asyncio.sleep(delay)
+        raise LLMError("Z.ai не ответил")
 
     async def complete(self, system: str, user: str, max_tokens: int = 1024) -> str:
-        payload = {
+        response = await self._post({
             "model": self._model,
             "messages": [
                 {"role": "system", "content": system},
@@ -113,20 +67,20 @@ class GigaChatClient:
             ],
             "max_tokens": max_tokens,
             "stream": False,
-        }
-        token = await self._get_token()
-        response = await self._post_chat(payload, token)
-        if response.status_code == 401:
-            token = await self._get_token(stale_token=token)
-            response = await self._post_chat(payload, token)
+            "thinking": {"type": "disabled"},
+        })
         if response.status_code != 200:
-            raise LLMError(f"GigaChat вернул ошибку: HTTP {response.status_code}")
+            raise LLMError(f"Z.ai вернул ошибку: HTTP {response.status_code}, код {_error_code(response)}")
 
         try:
-            content = response.json()["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError, ValueError):
-            raise LLMError("GigaChat вернул ответ неизвестного формата") from None
+            choice = response.json()["choices"][0]
+            content = choice["message"].get("content")
+            finish_reason = choice.get("finish_reason")
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+            raise LLMError("Z.ai вернул ответ неизвестного формата") from None
+        if finish_reason in FAILED_FINISH_REASONS:
+            raise LLMError(f"Z.ai не завершил ответ: {finish_reason}")
         text = (content or "").strip()
         if not text:
-            raise LLMError("GigaChat вернул пустой ответ")
+            raise LLMError("Z.ai вернул пустой ответ")
         return text
