@@ -1,4 +1,4 @@
-"""Telegram bot that uses GigaChat API to build 1-minute videos from prompts."""
+"""Telegram bot that uses the Z.ai GLM API to build 1-minute videos from prompts."""
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +15,7 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand, FSInputFile, Message
 from dotenv import load_dotenv
 
-from .llm import GigaChatClient
+from .llm import DEFAULT_MODEL, ZaiClient
 from .video_generator import async_build_video_from_storyboard, VideoGenerationError
 
 logger = logging.getLogger(__name__)
@@ -26,12 +26,10 @@ MAX_PROMPT_LENGTH = 1000
 @dataclass
 class Settings:
     telegram_token: str
-    gigachat_auth_key: str
+    zai_api_key: str
     output_dir: Path = Path("videos")
     video_duration: int = 60
-    gigachat_model: str = "GigaChat"
-    gigachat_scope: str = "GIGACHAT_API_PERS"
-    gigachat_ca_bundle_file: str | None = None
+    zai_model: str = DEFAULT_MODEL
     max_parallel_renders: int = 1
 
 
@@ -46,22 +44,20 @@ def load_settings() -> Settings:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("Environment variable TELEGRAM_BOT_TOKEN is required")
-    auth_key = os.getenv("GIGACHAT_AUTH_KEY")
-    if not auth_key:
-        raise RuntimeError("Environment variable GIGACHAT_AUTH_KEY is required")
+    api_key = os.getenv("ZAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Environment variable ZAI_API_KEY is required")
     return Settings(
         telegram_token=token,
-        gigachat_auth_key=auth_key,
+        zai_api_key=api_key,
         output_dir=Path(os.getenv("VIDEO_OUTPUT_DIR", "videos")),
         video_duration=int(os.getenv("VIDEO_DURATION", "60")),
-        gigachat_model=os.getenv("GIGACHAT_MODEL", "GigaChat"),
-        gigachat_scope=os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS"),
-        gigachat_ca_bundle_file=os.getenv("GIGACHAT_CA_BUNDLE_FILE") or None,
+        zai_model=os.getenv("ZAI_MODEL", DEFAULT_MODEL),
         max_parallel_renders=max(1, int(os.getenv("MAX_PARALLEL_RENDERS", "1"))),
     )
 
 
-async def generate_storyboard(prompt: str, llm: GigaChatClient) -> str:
+async def generate_storyboard(prompt: str, llm: ZaiClient) -> str:
     return await llm.complete(
         "You create concise video storyboards. Return 8-12 short scenes "
         "(bulleted list) that together form a coherent one-minute video. "
@@ -71,7 +67,7 @@ async def generate_storyboard(prompt: str, llm: GigaChatClient) -> str:
 
 
 async def handle_video_command(
-    message: Message, settings: Settings, limiter: RenderLimiter, llm: GigaChatClient
+    message: Message, settings: Settings, limiter: RenderLimiter, llm: ZaiClient
 ) -> None:
     if not message.text or message.from_user is None:
         return
@@ -132,12 +128,7 @@ async def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = load_settings()
 
-    llm = GigaChatClient(
-        settings.gigachat_auth_key,
-        scope=settings.gigachat_scope,
-        model=settings.gigachat_model,
-        ca_bundle_file=settings.gigachat_ca_bundle_file,
-    )
+    llm = ZaiClient(settings.zai_api_key, model=settings.zai_model)
     bot = Bot(token=settings.telegram_token, parse_mode=ParseMode.HTML)
     dp = Dispatcher()
     limiter = RenderLimiter(asyncio.Semaphore(settings.max_parallel_renders))

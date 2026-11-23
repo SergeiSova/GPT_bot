@@ -1,7 +1,6 @@
 __pycache__/
 .env
+.venv/
 videos/
 *.mp4
 *.log
-*.cer
-*.crt
