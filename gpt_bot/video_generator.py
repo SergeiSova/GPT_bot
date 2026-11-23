@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import zlib
 from pathlib import Path
 from typing import List
 
@@ -11,6 +12,8 @@ from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import ImageClip, concatenate_videoclips
 
 DEFAULT_RESOLUTION = (1280, 720)
+MAX_SCENES = 12
+FONT_CANDIDATES = ("DejaVuSans.ttf", "arial.ttf")
 
 
 class VideoGenerationError(RuntimeError):
@@ -52,20 +55,23 @@ def parse_storyboard(storyboard: str) -> List[str]:
         if not line:
             continue
         lines.append(line)
-    return lines
+    return lines[:MAX_SCENES]
 
 
 def _render_scene(text: str, resolution: tuple[int, int]) -> np.ndarray:
     """Render the text to an RGB frame using Pillow."""
-    image = Image.new("RGB", resolution, _pick_background_color(hash(text) % 10_000))
+    image = Image.new("RGB", resolution, _pick_background_color(zlib.crc32(text.encode("utf-8")) % 10_000))
     draw = ImageDraw.Draw(image)
     width, height = image.size
 
     # Try to load a truetype font. Fall back to default if unavailable.
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", size=42)
-    except OSError:
-        font = ImageFont.load_default()
+    font = ImageFont.load_default()
+    for font_name in FONT_CANDIDATES:
+        try:
+            font = ImageFont.truetype(font_name, size=42)
+            break
+        except OSError:
+            continue
 
     max_text_width = width - 80
     words = text.split()
@@ -123,17 +129,22 @@ def build_video_from_storyboard(
         clips.append(clip)
 
     video = concatenate_videoclips(clips, method="compose")
-    video.write_videofile(
-        str(output_path),
-        fps=24,
-        codec="libx264",
-        audio=False,
-        verbose=False,
-        logger=None,
-    )
-    video.close()
-    for clip in clips:
-        clip.close()
+    try:
+        video.write_videofile(
+            str(output_path),
+            fps=24,
+            codec="libx264",
+            audio=False,
+            verbose=False,
+            logger=None,
+        )
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+    finally:
+        video.close()
+        for clip in clips:
+            clip.close()
 
     return output_path
 

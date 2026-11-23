@@ -4,11 +4,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
@@ -21,6 +21,8 @@ from .video_generator import async_build_video_from_storyboard, VideoGenerationE
 
 logger = logging.getLogger(__name__)
 
+MAX_PROMPT_LENGTH = 1000
+
 
 @dataclass
 class Settings:
@@ -28,6 +30,13 @@ class Settings:
     output_dir: Path = Path("videos")
     video_duration: int = 60
     model: str = "gpt-4o-mini"
+    max_parallel_renders: int = 1
+
+
+@dataclass
+class RenderLimiter:
+    semaphore: asyncio.Semaphore
+    active_users: set[int] = field(default_factory=set)
 
 
 def load_settings() -> Settings:
@@ -38,7 +47,8 @@ def load_settings() -> Settings:
     output_dir = Path(os.getenv("VIDEO_OUTPUT_DIR", "videos"))
     duration = int(os.getenv("VIDEO_DURATION", "60"))
     model = os.getenv("G4F_MODEL", "gpt-4o-mini")
-    return Settings(token, output_dir, duration, model)
+    max_parallel_renders = max(1, int(os.getenv("MAX_PARALLEL_RENDERS", "1")))
+    return Settings(token, output_dir, duration, model, max_parallel_renders)
 
 
 def _stringify_message_content(value: Any) -> str:
@@ -115,11 +125,11 @@ async def generate_storyboard(prompt: str, model: str) -> str:
     return content
 
 
-async def handle_video_command(message: Message, settings: Settings) -> None:
-    if not message.text:
+async def handle_video_command(message: Message, settings: Settings, limiter: RenderLimiter) -> None:
+    if not message.text or message.from_user is None:
         return
     parts = message.text.split(maxsplit=1)
-    prompt = parts[1] if len(parts) > 1 else ""
+    prompt = parts[1].strip() if len(parts) > 1 else ""
     if not prompt:
         await message.answer(
             "Пожалуйста, добавьте описание после команды. Например:\n"
@@ -127,35 +137,43 @@ async def handle_video_command(message: Message, settings: Settings) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
+    if len(prompt) > MAX_PROMPT_LENGTH:
+        await message.answer(f"Описание слишком длинное. Максимум {MAX_PROMPT_LENGTH} символов.")
+        return
 
+    user_id = message.from_user.id
+    if user_id in limiter.active_users:
+        await message.answer("Ваше видео уже создаётся. Дождитесь результата.")
+        return
+
+    limiter.active_users.add(user_id)
+    final_path = None
     status = await message.answer("Генерирую раскадровку с помощью g4f...")
     try:
         storyboard = await generate_storyboard(prompt, settings.model)
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"video_{timestamp}.mp4"
-        output_path = settings.output_dir / filename
+        output_path = settings.output_dir / f"video_{uuid4().hex}.mp4"
         await status.edit_text("Создаю видео из раскадровки...")
-        final_path = await async_build_video_from_storyboard(
-            storyboard, output_path, settings.video_duration
-        )
+        async with limiter.semaphore:
+            final_path = await async_build_video_from_storyboard(
+                storyboard, output_path, settings.video_duration
+            )
+        await status.edit_text("Видео готово! Отправляю файл...")
+        await message.answer_video(FSInputFile(final_path))
     except VideoGenerationError:
         logger.warning("Storyboard generation returned no scenes")
         await status.edit_text(
             "Не удалось создать видео: модель не вернула ни одной сцены. Попробуйте другой запрос."
         )
-        return
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.exception("Failed to generate video")
-        await status.edit_text(f"Произошла ошибка при создании видео: {exc}")
-        return
-
-    await status.edit_text("Видео готово! Отправляю файл...")
-    await message.answer_video(FSInputFile(final_path))
-
-    try:
-        os.remove(final_path)
-    except OSError:
-        logger.warning("Could not remove temporary file %s", final_path)
+        await status.edit_text("Произошла ошибка при создании видео. Попробуйте позже.")
+    finally:
+        limiter.active_users.discard(user_id)
+        if final_path is not None:
+            try:
+                os.remove(final_path)
+            except OSError:
+                logger.warning("Could not remove temporary file %s", final_path)
 
 
 async def _register_commands(bot: Bot) -> None:
@@ -168,7 +186,8 @@ async def main() -> None:
 
     bot = Bot(token=settings.telegram_token, parse_mode=ParseMode.HTML)
     dp = Dispatcher()
-    dp.message.register(partial(handle_video_command, settings=settings), Command("video"))
+    limiter = RenderLimiter(asyncio.Semaphore(settings.max_parallel_renders))
+    dp.message.register(partial(handle_video_command, settings=settings, limiter=limiter), Command("video"))
 
     await bot.delete_webhook(drop_pending_updates=True)
     await _register_commands(bot)
